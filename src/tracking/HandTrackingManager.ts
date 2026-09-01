@@ -29,6 +29,50 @@ import {
   type VideoFrameSubscription,
 } from './VideoFrameSource';
 
+/**
+ * ---------------------------------------------------------------------------
+ * Refactor summary (see inline comments at each change for the full
+ * rationale):
+ *
+ * 1. FPS stabilization  - `tryInference` now gates on a fixed-timestep
+ *    accumulator instead of a "time since last trigger" check. The naive
+ *    check silently drifts the achieved rate below target because the small
+ *    overshoot past the threshold gets discarded every cycle; the
+ *    accumulator carries that remainder forward so the long-run average
+ *    converges on `targetInferenceFps`.
+ *
+ * 2. Screen-tear prevention / rAF sync - added `getInterpolatedHands(now)`.
+ *    Rather than the manager owning its own `requestAnimationFrame` loop
+ *    (which would race with whatever loop the host app already uses to
+ *    paint - three.js, a `<canvas>` 2D loop, React Three Fiber's
+ *    `useFrame`, etc.), the manager exposes a pure, on-demand function the
+ *    host calls from *its* rAF callback. That keeps the interpolated pose
+ *    always time-correct for the exact instant the browser is about to
+ *    paint, which is what actually prevents visible tearing/stutter -
+ *    spinning up a second independent timer would not.
+ *
+ * 3. Latency - interpolation is applied only to the visual `landmarks`
+ *    path used for rendering. `gestureLandmarks` (already documented as
+ *    "Lower-latency filtering reserved for gesture recognition") and the
+ *    raw inference `snapshot.hands` are untouched, so gesture recognition
+ *    keeps running at native inference cadence with zero added delay.
+ *
+ * 4. Smoothing & stability - a motion-adaptive extrapolation ceiling
+ *    (`motionTrust`, derived from the filter's existing `fastMotionBlend`)
+ *    plus an EMA-smoothed inference-interval estimate
+ *    (`smoothedInferenceIntervalMs`) act as a dynamic trust factor: fast
+ *    hands get a short lookahead (less overshoot risk), slow/steady hands
+ *    get a longer one (smoother glide), and the interpolation timebase
+ *    itself is insulated from irregular arrival jitter.
+ *
+ * 5. Resource efficiency - filter/media-pipe config setters now short-
+ *    circuit on a shallow-equality check before re-sanitizing or touching
+ *    the worker, and the `filterConfig` getter (plus the internal per-frame
+ *    variant used in `updateSnapshot`) is cached behind a revision counter
+ *    instead of allocating fresh nested objects on every read/frame.
+ * ---------------------------------------------------------------------------
+ */
+
 export type Handedness = 'Left' | 'Right' | 'Unknown';
 export type HandTrackingStatus = 'idle' | 'loading' | 'online' | 'error';
 export type HandTrackingRate = 'auto' | 30 | 45 | 60;
@@ -91,6 +135,26 @@ export interface HandTrackingSnapshot {
   timestamp: number;
 }
 
+/**
+ * A lightweight, render-only hand pose returned by
+ * `HandTrackingManager.getInterpolatedHands()`. Deliberately a subset of
+ * `TrackedHand` - it omits `gestureLandmarks`/`rawLandmarks` because those
+ * feed gesture recognition, which must never be smoothed/interpolated (that
+ * would add latency to detection). Call this from your own
+ * `requestAnimationFrame` / render-loop callback, once per paint, to get a
+ * pose whose timing matches the instant the frame will actually be drawn.
+ */
+export interface RenderHandPose {
+  handedness: Handedness;
+  landmarks: readonly HandLandmarkPoint[];
+  wrist: HandLandmarkPoint;
+  fingertips: FingertipPositions;
+  confidence: number;
+  isHeld: boolean;
+  /** True when `now` is past the last inference sample and this pose was extrapolated rather than interpolated. */
+  isExtrapolated: boolean;
+}
+
 const WASM_PATH = '/mediapipe/wasm';
 const MODEL_PATH = '/models/hand_landmarker.task';
 
@@ -138,6 +202,86 @@ function createLandmarkBuffer(): HandLandmarkPoint[] {
     { length: 21 },
     (): HandLandmarkPoint => ({ x: 0, y: 0, z: 0 }),
   );
+}
+
+/**
+ * Cheap flat-object equality used to short-circuit config setters. All the
+ * config types here (`OneEuroFilterConfig`, `MotionResponseConfig`,
+ * `MediaPipeTrackingConfig`) are single-level records of primitives, so a
+ * `for...in` comparison is sufficient and avoids pulling in a deep-equal
+ * dependency for what is a hot-ish path (called from UI sliders/panels).
+ */
+function shallowEqualConfig<T extends Record<string, unknown>>(
+  a: T,
+  b: T,
+): boolean {
+  for (const key in a) {
+    if (a[key] !== b[key]) return false;
+  }
+  for (const key in b) {
+    if (!(key in a)) return false;
+  }
+  return true;
+}
+
+function lerpPoint(
+  from: HandLandmarkPoint,
+  to: HandLandmarkPoint,
+  t: number,
+): HandLandmarkPoint {
+  return {
+    x: from.x + (to.x - from.x) * t,
+    y: from.y + (to.y - from.y) * t,
+    z: from.z + (to.z - from.z) * t,
+    // Visibility isn't a spatial quantity - carry the destination's value
+    // rather than blending it.
+    visibility: to.visibility,
+  };
+}
+
+/** Builds a render pose straight from a `TrackedHand`, no interpolation. */
+function toRenderPose(hand: TrackedHand, isExtrapolated: boolean): RenderHandPose {
+  return {
+    handedness: hand.handedness,
+    landmarks: hand.landmarks,
+    wrist: hand.wrist,
+    fingertips: hand.fingertips,
+    confidence: hand.confidence,
+    isHeld: hand.isHeld,
+    isExtrapolated,
+  };
+}
+
+/**
+ * Interpolates (t <= 1) or lightly extrapolates (t > 1) the *visual*
+ * landmark set between two consecutive inference results. Only the 21-point
+ * `landmarks` array is touched - this is the array `TrackedHand` documents
+ * as being used "for effects and the debug overlay", i.e. exactly what a
+ * renderer draws.
+ */
+function interpolateHand(
+  previous: TrackedHand,
+  current: TrackedHand,
+  t: number,
+): RenderHandPose {
+  const landmarks = current.landmarks.map((point, index) =>
+    lerpPoint(previous.landmarks[index] ?? point, point, t),
+  );
+  return {
+    handedness: current.handedness,
+    landmarks,
+    wrist: landmarks[0],
+    fingertips: {
+      thumb: landmarks[4],
+      index: landmarks[8],
+      middle: landmarks[12],
+      ring: landmarks[16],
+      pinky: landmarks[20],
+    },
+    confidence: current.confidence,
+    isHeld: current.isHeld,
+    isExtrapolated: t > 1,
+  };
 }
 
 /** Owns MediaPipe and keeps frame-rate tracking data outside React state. */
@@ -191,6 +335,23 @@ export class HandTrackingManager {
   private optionsDebounceId: number | null = null;
   private trackingLostCount = 0;
   private reacquisitionCount = 0;
+
+  // --- Fixed-timestep accumulator for inference gating (FPS stabilization).
+  // See the class-level comment (item 1) for why this replaces a naive
+  // "time since last trigger" check.
+  private lastFrameCallbackAt = 0;
+  private inferenceAccumulatorMs = 0;
+
+  // --- Render-interpolation state (screen-tear prevention / item 2 & 4).
+  // "current"/"previous" refer to the two most recent inference results,
+  // keyed by the same per-hand tracking key used elsewhere in this class.
+  private previousInferenceHands = new Map<string, TrackedHand>();
+  private currentInferenceHands = new Map<string, TrackedHand>();
+  private previousInferenceReceivedAt = 0;
+  private currentInferenceReceivedAt = 0;
+  /** EMA of the wall-clock gap between inference results, used as the interpolation timebase instead of the raw (jittery) gap. */
+  private smoothedInferenceIntervalMs = 0;
+
   private mediaPipeConfig: MediaPipeTrackingConfig = {
     minHandDetectionConfidence: 0.5,
     minHandPresenceConfidence: 0.5,
@@ -206,6 +367,18 @@ export class HandTrackingManager {
   private motionResponseConfig: MotionResponseConfig = {
     ...DEFAULT_MOTION_RESPONSE_CONFIG,
   };
+
+  // --- Config caching (resource efficiency / item 5). A revision counter
+  // rather than a single dirty flag, because two independent caches
+  // (`filterConfig` and the internal per-frame variant) each need to know
+  // whether *they* are stale, and a single boolean cleared by whichever one
+  // reads first would leave the other silently stale.
+  private filterConfigRevision = 0;
+  private cachedFilterConfig: LandmarkFilterConfig | null = null;
+  private cachedFilterConfigRevision = -1;
+  private cachedInternalFilterConfig: LandmarkFilterConfig | null = null;
+  private cachedInternalFilterConfigRevision = -1;
+
   private readonly handFilters = new Map<string, HandFilterState>();
   private readonly statusListeners = new Set<
     (status: HandTrackingStatus) => void
@@ -216,12 +389,23 @@ export class HandTrackingManager {
   }
 
   get filterConfig(): LandmarkFilterConfig {
-    return {
-      visual: { ...this.visualFilterConfig },
-      gesture: { ...this.gestureFilterConfig },
-      fingertipCutoffMultiplier: this.fingertipCutoffMultiplier,
-      motion: { ...this.motionResponseConfig },
-    };
+    // Cached behind a revision counter so components that read this every
+    // render (e.g. a debug/tuning panel) don't force a fresh object plus
+    // three nested-object allocations on every access - only setters that
+    // actually change a value bump the revision.
+    if (
+      !this.cachedFilterConfig ||
+      this.cachedFilterConfigRevision !== this.filterConfigRevision
+    ) {
+      this.cachedFilterConfig = {
+        visual: { ...this.visualFilterConfig },
+        gesture: { ...this.gestureFilterConfig },
+        fingertipCutoffMultiplier: this.fingertipCutoffMultiplier,
+        motion: { ...this.motionResponseConfig },
+      };
+      this.cachedFilterConfigRevision = this.filterConfigRevision;
+    }
+    return this.cachedFilterConfig;
   }
 
   get motionConfig(): MotionResponseConfig {
@@ -233,34 +417,53 @@ export class HandTrackingManager {
   }
 
   setVisualFilterConfig(config: Partial<OneEuroFilterConfig>): void {
-    this.visualFilterConfig = sanitizeFilterConfig({
+    const next = sanitizeFilterConfig({
       ...this.visualFilterConfig,
       ...config,
     });
+    // Skip the write (and the cache invalidation it would trigger) when
+    // sanitization resolves to the same values, e.g. a UI slider re-firing
+    // its current value.
+    if (shallowEqualConfig(next, this.visualFilterConfig)) return;
+    this.visualFilterConfig = next;
+    this.filterConfigRevision += 1;
   }
 
   setGestureFilterConfig(config: Partial<OneEuroFilterConfig>): void {
-    this.gestureFilterConfig = sanitizeFilterConfig({
+    const next = sanitizeFilterConfig({
       ...this.gestureFilterConfig,
       ...config,
     });
+    if (shallowEqualConfig(next, this.gestureFilterConfig)) return;
+    this.gestureFilterConfig = next;
+    this.filterConfigRevision += 1;
   }
 
   setFingertipCutoffMultiplier(multiplier: number): void {
-    this.fingertipCutoffMultiplier = clamp(multiplier, 0.7, 1);
+    const next = clamp(multiplier, 0.7, 1);
+    if (next === this.fingertipCutoffMultiplier) return;
+    this.fingertipCutoffMultiplier = next;
+    this.filterConfigRevision += 1;
   }
 
   setMotionResponseConfig(config: Partial<MotionResponseConfig>): void {
-    this.motionResponseConfig = sanitizeMotionResponseConfig({
+    const next = sanitizeMotionResponseConfig({
       ...this.motionResponseConfig,
       ...config,
     });
+    if (shallowEqualConfig(next, this.motionResponseConfig)) return;
+    this.motionResponseConfig = next;
+    this.filterConfigRevision += 1;
   }
 
   setTrackingRate(rate: HandTrackingRate): void {
     this.trackingRate = rate;
     this.lastAutoRateEvaluationAt = 0;
     this.targetInferenceFps = rate === 'auto' ? 30 : rate;
+    // The accumulator's banked time was measured against the *old*
+    // interval; carrying it over could fire an inference immediately under
+    // the new rate. Resetting keeps the rate change phase-clean.
+    this.inferenceAccumulatorMs = 0;
     this.latestSnapshot = {
       ...this.latestSnapshot,
       trackingRate: rate,
@@ -269,7 +472,7 @@ export class HandTrackingManager {
   }
 
   setMediaPipeConfig(config: Partial<MediaPipeTrackingConfig>): void {
-    this.mediaPipeConfig = {
+    const next: MediaPipeTrackingConfig = {
       minHandDetectionConfidence: clamp(
         config.minHandDetectionConfidence ??
           this.mediaPipeConfig.minHandDetectionConfidence,
@@ -288,6 +491,11 @@ export class HandTrackingManager {
         0.8,
       ),
     };
+
+    // Resource efficiency: skip the debounce timer and worker round-trip
+    // entirely when nothing actually changed.
+    if (shallowEqualConfig(next, this.mediaPipeConfig)) return;
+    this.mediaPipeConfig = next;
 
     if (!this.worker || !this.activeDelegate) return;
     if (this.optionsDebounceId !== null) {
@@ -325,6 +533,55 @@ export class HandTrackingManager {
       ...this.latestSnapshot,
       renderFps: this.measuredRenderFps,
     };
+  }
+
+  /**
+   * Returns a smoothly interpolated/lightly-extrapolated hand pose for
+   * `now` (defaults to `performance.now()`). Call this once per tick from
+   * your own render loop's `requestAnimationFrame` / `useFrame` callback -
+   * see the class-level comment (item 2) for why the manager doesn't run
+   * its own rAF loop. Inference typically runs at 30-60fps while a display
+   * can refresh at 60-120Hz+; without this, hands visibly "step" between
+   * inference samples. With it, the returned pose always matches the exact
+   * instant the browser is about to paint, which is what removes both the
+   * stepping and any tearing relative to the render loop.
+   *
+   * Gesture recognition should keep reading `snapshot.hands[*].gestureLandmarks`
+   * directly - never this - so recognition latency stays untouched.
+   */
+  getInterpolatedHands(now: number = performance.now()): RenderHandPose[] {
+    const results: RenderHandPose[] = [];
+    const interval =
+      this.smoothedInferenceIntervalMs > 0
+        ? this.smoothedInferenceIntervalMs
+        : 1000 / this.targetInferenceFps;
+
+    for (const [trackingKey, currentHand] of this.currentInferenceHands) {
+      const previousHand = this.previousInferenceHands.get(trackingKey);
+      const elapsed = now - this.currentInferenceReceivedAt;
+
+      if (!previousHand || currentHand.isHeld || elapsed <= 0) {
+        // Nothing sensible to interpolate from - a brand-new hand, a
+        // dropout-hold frame (already a frozen snapshot), or a render tick
+        // that landed before this inference result was processed. Show the
+        // latest known pose rather than guessing.
+        results.push(toRenderPose(currentHand, false));
+        continue;
+      }
+
+      // Motion-adaptive extrapolation ceiling (item 4): prediction error
+      // compounds with acceleration, so fast-moving hands (`fastMotionBlend`
+      // near 1) get pulled back toward a short lookahead, while slow/steady
+      // hands are allowed to glide up to 1.6x past the last sample for a
+      // smoother feel instead of visibly "waiting" for the next inference.
+      const motionTrust = clamp(1 - currentHand.fastMotionBlend, 0.35, 1);
+      const maxLookaheadFactor = 1 + motionTrust * 0.6;
+      const t = clamp(elapsed / interval, 0, maxLookaheadFactor);
+
+      results.push(interpolateHand(previousHand, currentHand, t));
+    }
+
+    return results;
   }
 
   subscribeStatus(listener: (status: HandTrackingStatus) => void): () => void {
@@ -438,8 +695,26 @@ export class HandTrackingManager {
     videoTime: number,
     capture: VideoFrameCapture,
   ) {
-    const intervalElapsed =
-      now - this.lastInferenceStartedAt >= 1000 / this.targetInferenceFps;
+    // Fixed-timestep accumulator (item 1). We accumulate real elapsed time
+    // every frame callback and, when we actually fire, subtract exactly one
+    // target interval rather than resetting to zero. Any leftover carries
+    // into the next cycle, so the achieved average rate converges on
+    // `targetInferenceFps` instead of drifting low - which is what a naive
+    // "now - lastStart >= interval" check does, since it discards whatever
+    // small overshoot existed at the moment of the check on every cycle.
+    const dt = this.lastFrameCallbackAt === 0 ? 0 : now - this.lastFrameCallbackAt;
+    this.lastFrameCallbackAt = now;
+    this.inferenceAccumulatorMs += dt;
+
+    const targetIntervalMs = 1000 / this.targetInferenceFps;
+    // Cap the bank so a backgrounded/throttled tab regaining focus doesn't
+    // cause a burst of queued catch-up inferences all at once.
+    if (this.inferenceAccumulatorMs > targetIntervalMs * 2) {
+      this.inferenceAccumulatorMs = targetIntervalMs;
+    }
+
+    const intervalElapsed = this.inferenceAccumulatorMs >= targetIntervalMs;
+
     if (
       video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA ||
       videoTime === this.lastVideoTime ||
@@ -450,6 +725,7 @@ export class HandTrackingManager {
       return;
     }
 
+    this.inferenceAccumulatorMs -= targetIntervalMs;
     this.lastVideoTime = videoTime;
     this.lastInferenceStartedAt = now;
     this.inferenceInProgress = true;
@@ -591,11 +867,38 @@ export class HandTrackingManager {
         : this.video?.srcObject instanceof MediaStream
           ? (this.video.srcObject.getVideoTracks()[0]?.getSettings().frameRate ?? 30)
           : 30;
-    this.targetInferenceFps = chooseAutoInferenceRate(
+    const nextTargetFps = chooseAutoInferenceRate(
       cameraRate,
       this.averagedInferenceTimeMs,
       this.measuredRenderFps,
     );
+    if (nextTargetFps !== this.targetInferenceFps) {
+      this.targetInferenceFps = nextTargetFps;
+      // Keep the accumulator phase-clean across a rate change, same
+      // reasoning as in `setTrackingRate`.
+      this.inferenceAccumulatorMs = 0;
+    }
+  }
+
+  private getInternalFilterConfig(): LandmarkFilterConfig {
+    // Same cache-behind-a-revision strategy as the public `filterConfig`
+    // getter, but this one holds direct references (no spreads) since it's
+    // rebuilt at most once per inference result and consumed synchronously
+    // by `HandLandmarkFilter.filter` within the same call - no need to pay
+    // for a defensive copy on this path.
+    if (
+      !this.cachedInternalFilterConfig ||
+      this.cachedInternalFilterConfigRevision !== this.filterConfigRevision
+    ) {
+      this.cachedInternalFilterConfig = {
+        visual: this.visualFilterConfig,
+        gesture: this.gestureFilterConfig,
+        fingertipCutoffMultiplier: this.fingertipCutoffMultiplier,
+        motion: this.motionResponseConfig,
+      };
+      this.cachedInternalFilterConfigRevision = this.filterConfigRevision;
+    }
+    return this.cachedInternalFilterConfig;
   }
 
   private updateSnapshot(result: WorkerResultMessage) {
@@ -624,14 +927,30 @@ export class HandTrackingManager {
       this.fpsWindowStartedAt = timestamp;
     }
 
+    // --- Render-interpolation bookkeeping (item 2 & 4) ------------------
+    // Roll "current" into "previous" and smooth the arrival-interval
+    // estimate with an EMA so `getInterpolatedHands` has a stable timebase
+    // even when individual inference results arrive at irregular intervals
+    // (GC pauses, camera jitter, auto-rate changes, etc).
+    const previousReceivedAt = this.currentInferenceReceivedAt;
+    if (previousReceivedAt > 0) {
+      const rawIntervalMs = completedAt - previousReceivedAt;
+      if (rawIntervalMs > 0 && rawIntervalMs < 500) {
+        this.smoothedInferenceIntervalMs =
+          this.smoothedInferenceIntervalMs === 0
+            ? rawIntervalMs
+            : this.smoothedInferenceIntervalMs * 0.7 + rawIntervalMs * 0.3;
+      }
+    }
+    this.previousInferenceHands = this.currentInferenceHands;
+    this.previousInferenceReceivedAt = previousReceivedAt;
+    this.currentInferenceHands = new Map<string, TrackedHand>();
+    this.currentInferenceReceivedAt = completedAt;
+    // ----------------------------------------------------------------------
+
     const visibleKeys = new Set<string>();
     const hands: TrackedHand[] = [];
-    const filterConfig = {
-      visual: this.visualFilterConfig,
-      gesture: this.gestureFilterConfig,
-      fingertipCutoffMultiplier: this.fingertipCutoffMultiplier,
-      motion: this.motionResponseConfig,
-    };
+    const filterConfig = this.getInternalFilterConfig();
 
     for (let handIndex = 0; handIndex < result.handCount; handIndex += 1) {
       const classification = result.handedness[handIndex];
@@ -732,6 +1051,7 @@ export class HandTrackingManager {
       filterState.missingFrames = 0;
       filterState.awaitingReacquisition = false;
       hands.push(trackedHand);
+      this.currentInferenceHands.set(trackingKey, trackedHand);
     }
 
     for (const [trackingKey, filterState] of this.handFilters) {
@@ -753,7 +1073,9 @@ export class HandTrackingManager {
         filterState.recentHand &&
         hands.length < 2
       ) {
-        hands.push({ ...filterState.recentHand, isHeld: true });
+        const heldHand: TrackedHand = { ...filterState.recentHand, isHeld: true };
+        hands.push(heldHand);
+        this.currentInferenceHands.set(trackingKey, heldHand);
       } else {
         filterState.filter.reset();
         filterState.recentHand = null;
@@ -814,6 +1136,13 @@ export class HandTrackingManager {
     this.usingVideoFrameCallback = false;
     this.trackingLostCount = 0;
     this.reacquisitionCount = 0;
+    this.lastFrameCallbackAt = 0;
+    this.inferenceAccumulatorMs = 0;
+    this.previousInferenceHands = new Map();
+    this.currentInferenceHands = new Map();
+    this.previousInferenceReceivedAt = 0;
+    this.currentInferenceReceivedAt = 0;
+    this.smoothedInferenceIntervalMs = 0;
     this.handFilters.forEach((state) => {
       state.filter.reset();
       state.recentHand = null;
