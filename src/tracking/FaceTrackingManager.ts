@@ -7,7 +7,7 @@ import {
   subscribeToVideoFrames,
   type VideoFrameCapture,
   type VideoFrameSubscription,
-} from './VideoFrameSource';
+} from './VideoFrameSourc
 
 export type FaceTrackingStatus = 'idle' | 'loading' | 'online' | 'error';
 
