@@ -1135,7 +1135,6 @@ export class HandTrackingManager {
     this.inferenceAccumulatorMs = 0;
     this.previousInferenceHands = new Map();
     this.currentInferenceHands = new Map();
-    this.previousInferenceReceivedAt = 0;
     this.currentInferenceReceivedAt = 0;
     this.smoothedInferenceIntervalMs = 0;
     this.handFilters.forEach((state) => {
