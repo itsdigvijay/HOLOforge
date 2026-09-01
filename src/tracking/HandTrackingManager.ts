@@ -211,14 +211,14 @@ function createLandmarkBuffer(): HandLandmarkPoint[] {
  * `for...in` comparison is sufficient and avoids pulling in a deep-equal
  * dependency for what is a hot-ish path (called from UI sliders/panels).
  */
-function shallowEqualConfig<T extends Record<string, unknown>>(
+function shallowEqualConfig<T extends object>(
   a: T,
   b: T,
 ): boolean {
-  for (const key in a) {
+  for (const key of Object.keys(a) as Array<keyof T>) {
     if (a[key] !== b[key]) return false;
   }
-  for (const key in b) {
+  for (const key of Object.keys(b) as Array<keyof T>) {
     if (!(key in a)) return false;
   }
   return true;
@@ -312,7 +312,6 @@ export class HandTrackingManager {
   private usingVideoFrameCallback = false;
   private latestSnapshot: HandTrackingSnapshot = EMPTY_SNAPSHOT;
   private lastVideoTime = -1;
-  private lastInferenceStartedAt = 0;
   private fpsWindowStartedAt = 0;
   private framesInWindow = 0;
   private measuredFps = 0;
@@ -347,7 +346,6 @@ export class HandTrackingManager {
   // keyed by the same per-hand tracking key used elsewhere in this class.
   private previousInferenceHands = new Map<string, TrackedHand>();
   private currentInferenceHands = new Map<string, TrackedHand>();
-  private previousInferenceReceivedAt = 0;
   private currentInferenceReceivedAt = 0;
   /** EMA of the wall-clock gap between inference results, used as the interpolation timebase instead of the raw (jittery) gap. */
   private smoothedInferenceIntervalMs = 0;
@@ -727,7 +725,6 @@ export class HandTrackingManager {
 
     this.inferenceAccumulatorMs -= targetIntervalMs;
     this.lastVideoTime = videoTime;
-    this.lastInferenceStartedAt = now;
     this.inferenceInProgress = true;
     void this.sendLatestFrame(video, capture, now, this.runToken);
   }
@@ -943,7 +940,6 @@ export class HandTrackingManager {
       }
     }
     this.previousInferenceHands = this.currentInferenceHands;
-    this.previousInferenceReceivedAt = previousReceivedAt;
     this.currentInferenceHands = new Map<string, TrackedHand>();
     this.currentInferenceReceivedAt = completedAt;
     // ----------------------------------------------------------------------
@@ -1118,7 +1114,6 @@ export class HandTrackingManager {
 
   private resetFrameMetrics() {
     this.lastVideoTime = -1;
-    this.lastInferenceStartedAt = 0;
     this.fpsWindowStartedAt = 0;
     this.framesInWindow = 0;
     this.measuredFps = 0;
