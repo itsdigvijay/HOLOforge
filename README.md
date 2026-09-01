@@ -1,6 +1,6 @@
-#devs
+## 👨‍💻 Devs
 
-#dhruv_yadav (owner)
-#digvijay_singh (owner)
-#rishit_gupta (marketing)
-#sanvi (dev)
+- **Dhruv Yadav** — Owner
+- **Digvijay Singh** — Owner
+- **Rishit Gupta** — Marketing
+- **Sanvi** — Developer
