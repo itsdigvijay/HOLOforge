@@ -41,25 +41,26 @@ export interface FilteredLandmarkFrame {
 }
 
 export const DEFAULT_VISUAL_FILTER_CONFIG: Readonly<OneEuroFilterConfig> = {
-  minCutoff: 1.2,
-  beta: 1,
-  derivativeCutoff: 1,
+  minCutoff: 1.0,          // Slightly lower = smoother when hand is still
+  beta: 1.5,               // Higher = reacts faster to movement (kills lag!)
+  derivativeCutoff: 1.5,   // Higher = smoother speed calculation (kills choppiness!)
 };
 
 export const DEFAULT_GESTURE_FILTER_CONFIG: Readonly<OneEuroFilterConfig> = {
-  minCutoff: 2,
-  beta: 1.35,
-  derivativeCutoff: 1,
+  minCutoff: 1.5,          // Keep gestures stable, but not too laggy
+  beta: 1.8,               // Let gestures snap quickly when you move
+  derivativeCutoff: 1.5,
 };
 
 export const DEFAULT_MOTION_RESPONSE_CONFIG: Readonly<MotionResponseConfig> = {
-  fastVelocityThreshold: 1.25,
-  largeDisplacementThreshold: 0.1,
-  visualPredictionMs: 16,
-  maxPredictionDistance: 0.03,
+  fastVelocityThreshold: 1.0,   // Lowered slightly to trigger "fast mode" sooner
+  largeDisplacementThreshold: 0.08, // Lowered to catch big movements faster
+  visualPredictionMs: 20,       // Increased from 16 to predict ~1.5 frames ahead (hides lag)
+  maxPredictionDistance: 0.05,  // Increased slightly to allow the prediction to actually reach the target
 };
 
-export const DEFAULT_FINGERTIP_CUTOFF_MULTIPLIER = 0.88;
+// Keep this as is, it's already good for fingertips
+export const DEFAULT_FINGERTIP_CUTOFF_MULTIPLIER = 0.85; 
 export const DEFAULT_DROPOUT_TOLERANCE_MS = 75;
 export const DEFAULT_DROPOUT_FRAME_LIMIT = 2;
 
