@@ -97,20 +97,20 @@ const toDegrees = (radians: number) => (radians * 180) / Math.PI;
 const clamp = (value: number, min: number, max: number) =>
   Math.min(max, Math.max(min, value));
 
-function setPointFromLandmark(
-  point: FacePoint,
+function extractPointFromLandmark(
   landmarks: Float32Array,
   index: number,
-): void {
+): FacePoint {
   const offset = index * LANDMARK_STRIDE;
-  point.x = landmarks[offset] ?? 0;
-  point.y = landmarks[offset + 1] ?? 0;
-  point.z = landmarks[offset + 2] ?? 0;
+  return {
+    x: landmarks[offset] ?? 0,
+    y: landmarks[offset + 1] ?? 0,
+    z: landmarks[offset + 2] ?? 0,
+  };
 }
 
 function rotationFromMatrix(matrix: Float32Array): HeadRotation | null {
   if (matrix.length < 16) return null;
-  // MediaPipe returns its 4x4 facial transform flattened in row-major order.
   const m00 = matrix[0];
   const m10 = matrix[4];
   const m20 = matrix[8];
@@ -174,10 +174,6 @@ function facingFromRotation(rotation: HeadRotation): FacingDirection {
   return { horizontal, vertical, label };
 }
 
-/**
- * Owns one Face Landmarker and exposes a mutable latest-result snapshot.
- * Camera frames come from the same shared clock used by hand tracking.
- */
 export class FaceTrackingManager {
   private worker: Worker | null = null;
   private workerInitialization: Promise<MediaPipeDelegate> | null = null;
@@ -201,13 +197,6 @@ export class FaceTrackingManager {
   private measuredFps = 0;
   private averagedInferenceTimeMs = 0;
   private averagedTrackingLatencyMs = 0;
-  private readonly leftEyeCenter: FacePoint = { x: 0, y: 0, z: 0 };
-  private readonly rightEyeCenter: FacePoint = { x: 0, y: 0, z: 0 };
-  private readonly leftTemple: FacePoint = { x: 0, y: 0, z: 0 };
-  private readonly rightTemple: FacePoint = { x: 0, y: 0, z: 0 };
-  private readonly forehead: FacePoint = { x: 0, y: 0, z: 0 };
-  private readonly chin: FacePoint = { x: 0, y: 0, z: 0 };
-  private readonly faceCenter: FacePoint = { x: 0, y: 0, z: 0 };
   private readonly statusListeners = new Set<
     (status: FaceTrackingStatus) => void
   >();
@@ -222,10 +211,6 @@ export class FaceTrackingManager {
     return () => this.statusListeners.delete(listener);
   }
 
-  /**
-   * Enables transfer of the complete 478-point mesh for Developer Mode.
-   * Anchor tracking remains active when disabled, avoiding needless copies.
-   */
   setLandmarkVisualizationEnabled(enabled: boolean): void {
     if (this.landmarkVisualizationEnabled === enabled) return;
     this.landmarkVisualizationEnabled = enabled;
@@ -390,9 +375,6 @@ export class FaceTrackingManager {
     const message = event.data;
     if (message.type === 'ready') {
       this.activeDelegate = message.delegate;
-      // CPU hand + face inference can otherwise contend badly. A face mesh is
-      // spatially stable at a lower cadence, while GPU systems can sustain the
-      // smoother 15 FPS path without stealing hand-tracking throughput.
       this.targetInferenceFps = message.delegate === 'GPU' ? 15 : 8;
       this.latestSnapshot = {
         ...this.latestSnapshot,
@@ -412,15 +394,14 @@ export class FaceTrackingManager {
       return;
     }
 
-    const error = new Error(message.message);
+    const errorMsg = 'message' in message && typeof message.message === 'string'
+      ? message.message
+      : 'Unknown face tracking worker error';
+    const error = new Error(errorMsg);
     console.error('[HOLOFORGE] Face tracking worker:', error);
     if (!this.activeDelegate) {
       this.rejectWorkerInitialization?.(error);
-      this.worker?.terminate();
-      this.worker = null;
-      this.workerInitialization = null;
-      this.resolveWorkerInitialization = null;
-      this.rejectWorkerInitialization = null;
+      this.terminateWorker();
       return;
     }
     if (message.runToken === undefined || message.runToken === this.runToken) {
@@ -436,11 +417,7 @@ export class FaceTrackingManager {
     const error = new Error(event.message || 'Face tracking worker failed.');
     console.error('[HOLOFORGE] Face worker runtime error:', error);
     this.rejectWorkerInitialization?.(error);
-    this.worker?.terminate();
-    this.worker = null;
-    this.workerInitialization = null;
-    this.resolveWorkerInitialization = null;
-    this.rejectWorkerInitialization = null;
+    this.terminateWorker();
     this.activeDelegate = null;
     this.inferenceInProgress = false;
     this.stopFrameLoop();
@@ -448,6 +425,18 @@ export class FaceTrackingManager {
     this.setStatus('error');
     this.clearFace();
   };
+
+  private terminateWorker(): void {
+    if (this.worker) {
+      this.worker.removeEventListener('message', this.handleWorkerMessage);
+      this.worker.removeEventListener('error', this.handleWorkerRuntimeError);
+      this.worker.terminate();
+      this.worker = null;
+    }
+    this.workerInitialization = null;
+    this.resolveWorkerInitialization = null;
+    this.rejectWorkerInitialization = null;
+  }
 
   private updateSnapshot(result: FaceWorkerResultMessage): void {
     const completedAt = performance.now();
@@ -479,37 +468,27 @@ export class FaceTrackingManager {
       return;
     }
 
-    setPointFromLandmark(
-      this.leftEyeCenter,
-      result.keyLandmarks,
-      LEFT_IRIS_CENTER,
-    );
-    setPointFromLandmark(
-      this.rightEyeCenter,
-      result.keyLandmarks,
-      RIGHT_IRIS_CENTER,
-    );
-    setPointFromLandmark(this.leftTemple, result.keyLandmarks, LEFT_TEMPLE);
-    setPointFromLandmark(this.rightTemple, result.keyLandmarks, RIGHT_TEMPLE);
-    setPointFromLandmark(this.forehead, result.keyLandmarks, FOREHEAD);
-    setPointFromLandmark(this.chin, result.keyLandmarks, CHIN);
-    this.faceCenter.x = (this.leftTemple.x + this.rightTemple.x) * 0.5;
-    this.faceCenter.y = (this.forehead.y + this.chin.y) * 0.5;
-    this.faceCenter.z =
-      (this.leftTemple.z +
-        this.rightTemple.z +
-        this.forehead.z +
-        this.chin.z) *
-      0.25;
+    const leftEyeCenter = extractPointFromLandmark(result.keyLandmarks, LEFT_IRIS_CENTER);
+    const rightEyeCenter = extractPointFromLandmark(result.keyLandmarks, RIGHT_IRIS_CENTER);
+    const leftTemple = extractPointFromLandmark(result.keyLandmarks, LEFT_TEMPLE);
+    const rightTemple = extractPointFromLandmark(result.keyLandmarks, RIGHT_TEMPLE);
+    const forehead = extractPointFromLandmark(result.keyLandmarks, FOREHEAD);
+    const chin = extractPointFromLandmark(result.keyLandmarks, CHIN);
+    
+    const faceCenter: FacePoint = {
+      x: (leftTemple.x + rightTemple.x) * 0.5,
+      y: (forehead.y + chin.y) * 0.5,
+      z: (leftTemple.z + rightTemple.z + forehead.z + chin.z) * 0.25,
+    };
 
     const rotation =
       rotationFromMatrix(result.transformationMatrix) ??
       rotationFromLandmarks(
         result.keyLandmarks,
-        this.leftEyeCenter,
-        this.rightEyeCenter,
-        this.forehead,
-        this.chin,
+        leftEyeCenter,
+        rightEyeCenter,
+        forehead,
+        chin,
       );
 
     this.latestSnapshot = {
@@ -521,12 +500,12 @@ export class FaceTrackingManager {
       landmarkCount: this.landmarkVisualizationEnabled
         ? result.landmarkCount
         : 0,
-      leftEyeCenter: this.leftEyeCenter,
-      rightEyeCenter: this.rightEyeCenter,
-      leftTemple: this.leftTemple,
-      rightTemple: this.rightTemple,
-      forehead: this.forehead,
-      faceCenter: this.faceCenter,
+      leftEyeCenter,
+      rightEyeCenter,
+      leftTemple,
+      rightTemple,
+      forehead,
+      faceCenter,
       headRotation: rotation,
       facingDirection: facingFromRotation(rotation),
       confidence: result.confidence >= 0 ? result.confidence : null,
