@@ -7,7 +7,7 @@ import {
   subscribeToVideoFrames,
   type VideoFrameCapture,
   type VideoFrameSubscription,
-} from './} from './VideoFrameSource';
+} from './VideoFrameSource';
 
 export type FaceTrackingStatus = 'idle' | 'loading' | 'online' | 'error';
 
@@ -273,9 +273,13 @@ export class FaceTrackingManager {
     if (this.disposed) return;
     this.disposed = true;
     this.stop();
-    this.worker?.postMessage({ type: 'dispose' });
-    this.worker?.terminate();
-    this.worker = null;
+    if (this.worker) {
+      this.worker.removeEventListener('message', this.handleWorkerMessage);
+      this.worker.removeEventListener('error', this.handleWorkerRuntimeError);
+      this.worker.postMessage({ type: 'dispose' });
+      this.worker.terminate();
+      this.worker = null;
+    }
     this.workerInitialization = null;
     this.resolveWorkerInitialization = null;
     this.rejectWorkerInitialization = null;
