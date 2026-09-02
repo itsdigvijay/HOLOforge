@@ -12,6 +12,11 @@ let landmarker: FaceLandmarker | null = null;
 let outputLandmarks = false;
 const KEY_LANDMARK_INDICES = [473, 468, 454, 234, 10, 152, 1] as const;
 
+// Guards against MediaPipe's VIDEO-mode requirement that timestamps passed to
+// detectForVideo() strictly increase. Out-of-order postMessage delivery (rare
+// but possible under load) would otherwise throw and kill the worker.
+let lastTimestamp: number | null = null;
+
 const loadPublicModule = Function(
   'url',
   'return import(url)',
@@ -40,6 +45,93 @@ function supportsHardwareGpu(): boolean {
   }
 }
 
+// --- Jitter smoothing (One Euro Filter) -----------------------------------
+// Raw landmark/matrix output from the model is noisy frame-to-frame even
+// when the face is still, which shows up as visible shake in any overlay
+// driven by this data. One Euro adapts its cutoff to signal speed: it stays
+// tight (low lag) during fast motion and heavier (low jitter) when still,
+// which is why it's the standard choice for this over a plain EMA.
+// Tune minCutoff/beta per-signal below if you still see jitter or feel lag.
+class OneEuroFilter {
+  private xPrev: number | null = null;
+  private dxPrev = 0;
+  private tPrev: number | null = null;
+
+  constructor(
+    private minCutoff = 1.0,
+    private beta = 0.007,
+    private dCutoff = 1.0,
+  ) {}
+
+  private alpha(cutoff: number, dt: number): number {
+    const tau = 1 / (2 * Math.PI * cutoff);
+    return 1 / (1 + tau / dt);
+  }
+
+  filter(x: number, tMs: number): number {
+    if (this.tPrev === null) {
+      this.tPrev = tMs;
+      this.xPrev = x;
+      return x;
+    }
+    const dt = Math.max((tMs - this.tPrev) / 1000, 1e-3);
+    this.tPrev = tMs;
+
+    const prevX = this.xPrev ?? x;
+    const dx = (x - prevX) / dt;
+    const aD = this.alpha(this.dCutoff, dt);
+    const dxHat = aD * dx + (1 - aD) * this.dxPrev;
+    this.dxPrev = dxHat;
+
+    const cutoff = this.minCutoff + this.beta * Math.abs(dxHat);
+    const a = this.alpha(cutoff, dt);
+    const xHat = a * x + (1 - a) * prevX;
+    this.xPrev = xHat;
+    return xHat;
+  }
+}
+
+class VectorSmoother {
+  private filters: OneEuroFilter[] = [];
+
+  constructor(
+    private minCutoff: number,
+    private beta: number,
+    private dCutoff = 1.0,
+  ) {}
+
+  filter(values: Float32Array, tMs: number): Float32Array {
+    if (this.filters.length !== values.length) {
+      this.filters = Array.from(
+        { length: values.length },
+        () => new OneEuroFilter(this.minCutoff, this.beta, this.dCutoff),
+      );
+    }
+    const out = new Float32Array(values.length);
+    for (let i = 0; i < values.length; i += 1) {
+      out[i] = this.filters[i].filter(values[i], tMs);
+    }
+    return out;
+  }
+
+  reset() {
+    this.filters = [];
+  }
+}
+
+// Normalized landmark coords are small (0-1) and slow-moving -> low beta.
+// The transform matrix carries translation in larger units and needs to
+// track head motion more responsively -> higher beta so it doesn't lag.
+const keyLandmarkSmoother = new VectorSmoother(1.0, 0.02);
+const landmarkSmoother = new VectorSmoother(1.0, 0.02);
+const matrixSmoother = new VectorSmoother(1.0, 15);
+
+function resetSmoothers() {
+  keyLandmarkSmoother.reset();
+  landmarkSmoother.reset();
+  matrixSmoother.reset();
+}
+
 async function createLandmarker(
   wasmPath: string,
   modelPath: string,
@@ -60,6 +152,8 @@ async function createLandmarker(
   if (supportsHardwareGpu()) {
     try {
       landmarker = await initialize('GPU');
+      lastTimestamp = null;
+      resetSmoothers();
       return 'GPU';
     } catch {
       landmarker?.close();
@@ -68,6 +162,8 @@ async function createLandmarker(
   }
 
   landmarker = await initialize('CPU');
+  lastTimestamp = null;
+  resetSmoothers();
   return 'CPU';
 }
 
@@ -86,15 +182,30 @@ function processFrame(
     return;
   }
 
+  // Drop non-increasing timestamps instead of letting detectForVideo throw.
+  if (lastTimestamp !== null && timestamp <= lastTimestamp) {
+    frame.close();
+    return;
+  }
+  lastTimestamp = timestamp;
+
   try {
     const startedAt = performance.now();
     const result = landmarker.detectForVideo(frame, timestamp);
     const inferenceTimeMs = performance.now() - startedAt;
     const face = result.faceLandmarks[0];
     const detectedLandmarkCount = face?.length ?? 0;
+    const faceDetected = detectedLandmarkCount > 0;
+
+    if (!faceDetected) {
+      // Don't let filters blend stale state into the next detection -
+      // otherwise re-acquiring the face produces a visible slide-in.
+      resetSmoothers();
+    }
+
     const landmarkCount = outputLandmarks ? detectedLandmarkCount : 0;
-    const landmarks = new Float32Array(landmarkCount * 3);
-    const keyLandmarks = new Float32Array(
+    let landmarks = new Float32Array(landmarkCount * 3);
+    let keyLandmarks = new Float32Array(
       detectedLandmarkCount > 0 ? KEY_LANDMARK_INDICES.length * 3 : 0,
     );
     let visibilityTotal = 0;
@@ -124,14 +235,28 @@ function processFrame(
     }
 
     const matrixData = result.facialTransformationMatrixes[0]?.data ?? [];
-    const transformationMatrix = new Float32Array(matrixData);
+    let transformationMatrix = new Float32Array(matrixData);
+
+    if (faceDetected) {
+      keyLandmarks = keyLandmarkSmoother.filter(keyLandmarks, timestamp);
+      if (outputLandmarks && landmarks.length > 0) {
+        landmarks = landmarkSmoother.filter(landmarks, timestamp);
+      }
+      if (transformationMatrix.length > 0) {
+        transformationMatrix = matrixSmoother.filter(
+          transformationMatrix,
+          timestamp,
+        );
+      }
+    }
+
     post(
       {
         type: 'result',
         runToken,
         timestamp,
         inferenceTimeMs,
-        faceDetected: detectedLandmarkCount > 0,
+        faceDetected,
         keyLandmarks,
         landmarkCount,
         landmarks,
@@ -182,7 +307,11 @@ workerScope.onmessage = (event: MessageEvent<FaceTrackingWorkerRequest>) => {
     return;
   }
 
-  landmarker?.close();
+  try {
+    landmarker?.close();
+  } catch {
+    // Already torn down or never fully initialized - safe to ignore.
+  }
   landmarker = null;
   workerScope.close();
 };
