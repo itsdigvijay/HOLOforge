@@ -8,7 +8,6 @@ import {
   type VideoFrameCapture,
   type VideoFrameSubscription,
 } from './VideoFrameSource';
-
 export type FaceTrackingStatus = 'idle' | 'loading' | 'online' | 'error';
 
 export interface FacePoint {
@@ -258,6 +257,9 @@ export class FaceTrackingManager {
     if (this.disposed) return;
     this.disposed = true;
     this.stop();
+    this.terminateWorker();
+    this.activeDelegate = null;
+    this.statusListeners.clear();
     if (this.worker) {
       this.worker.removeEventListener('message', this.handleWorkerMessage);
       this.worker.removeEventListener('error', this.handleWorkerRuntimeError);
